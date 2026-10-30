@@ -1,0 +1,6 @@
+.env
+.env.*
+.pepesto/
+memory.md
+__pycache__/
+*.pyc
