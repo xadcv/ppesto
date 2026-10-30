@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import json
 import os
@@ -404,27 +405,45 @@ def _words(text: str) -> set[str]:
     return {w.rstrip("s") for w in re.findall(r"[a-zà-ÿ]+", text.lower()) if len(w) > 2}
 
 
+def _similar(a: str, b: str) -> bool:
+    return a == b or (min(len(a), len(b)) >= 4 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.8)
+
+
+def _match_score(term: str, item: dict) -> float:
+    names = _words(item.get("item_name", ""))
+    for cand in item.get("products") or []:
+        names |= _words((cand.get("product") or {}).get("category", ""))
+    products: set[str] = set()
+    for cand in (item.get("products") or [])[:5]:
+        products |= _words((cand.get("product") or {}).get("product_name", ""))
+    score = 0.0
+    for word in _words(term):
+        if any(_similar(word, n) for n in names):
+            score += 1
+        elif any(_similar(word, p) for p in products):
+            score += 0.25
+    return score
+
+
 def map_items_to_terms(terms: list[str], items: list[dict]) -> dict[str, dict]:
-    """Pepesto renames items ("milk" -> "Cow's milk"); match them back to the user's words."""
+    """Pepesto renames and reorders items ("milk" -> "Cow's milk"); match them back to the user's words."""
+    pairs = sorted(
+        ((_match_score(t, it), -abs(ti - ii), ti, ii) for ti, t in enumerate(terms) for ii, it in enumerate(items)),
+        reverse=True,
+    )
     mapping: dict[str, dict] = {}
-    if len(items) == len(terms):
-        return dict(zip(terms, items))
-    remaining = list(items)
-    for term in terms:
-        best, best_score = None, 0
-        for item in remaining:
-            haystack = _words(item.get("item_name", ""))
-            for cand in item.get("products") or []:
-                haystack |= _words((cand.get("product") or {}).get("category", ""))
-            score = len(_words(term) & haystack)
-            if score > best_score:
-                best, best_score = item, score
-        if best is not None:
-            mapping[term] = best
-            remaining.remove(best)
+    used: set[int] = set()
+    for score, _, ti, ii in pairs:
+        if score <= 0:
+            break
+        if terms[ti] in mapping or ii in used:
+            continue
+        mapping[terms[ti]] = items[ii]
+        used.add(ii)
     leftover_terms = [t for t in terms if t not in mapping]
-    for term, item in zip(leftover_terms, remaining):
-        mapping[term] = item
+    leftover_items = [it for ii, it in enumerate(items) if ii not in used]
+    if len(leftover_terms) == len(leftover_items):
+        mapping.update(zip(leftover_terms, leftover_items))
     return mapping
 
 
@@ -432,7 +451,7 @@ def parse_picks(values: list[str]) -> dict[str, str]:
     picks = {}
     for value in values or []:
         if "=" not in value:
-            raise CliError(f"--pick expects TERM=N (or TERM=skip), got {value!r}")
+            raise CliError(f"--pick expects TERM=N, TERM=text or TERM=skip, got {value!r}")
         term, _, choice = value.rpartition("=")
         picks[normalize_term(term)] = choice.strip()
     return picks
@@ -502,6 +521,9 @@ def build_plan(
             continue
         if choice is not None and choice.lower() in {"skip", "s", "-"}:
             continue
+        if choice is not None and choice.lower() in {"text", "t"}:
+            plan.unresolved.append(item.raw)
+            continue
         index = 0
         if choice is not None:
             try:
@@ -517,7 +539,7 @@ def build_plan(
                 product=cand.name,
                 product_id=cand.product_id,
                 session_token=cand.session_token,
-                units=item.units or max(1, cand.suggested_units),
+                units=item.units or (max(1, cand.suggested_units) if _QTY_RE.match(item.raw) else 1),
                 price_cents=cand.price_cents,
                 source="auto" if choice is None else "picked",
                 barcode=cand.barcode,
@@ -547,11 +569,15 @@ def prompt_choice(term: str, candidates: list[Candidate], currency: str, prompt,
     for i, cand in enumerate(candidates[:limit], 1):
         print(f"  {i}. {describe(cand, currency)}", file=sys.stderr)
     while True:
-        answer = prompt(f"Pick 1-{min(limit, len(candidates))}, Enter for 1, 's' to skip: ").strip()
+        answer = prompt(
+            f"Pick 1-{min(limit, len(candidates))}, Enter for 1, 't' to let Pepesto find it at checkout, 's' to skip: "
+        ).strip()
         if not answer:
             return "1"
         if answer.lower() in {"s", "skip"}:
             return "skip"
+        if answer.lower() in {"t", "text"}:
+            return "text"
         if answer.isdigit() and 1 <= int(answer) <= min(limit, len(candidates)):
             return answer
         print("  Not a valid choice.", file=sys.stderr)
@@ -608,7 +634,7 @@ def plan_to_dict(plan: Plan, checkout: dict | None) -> dict:
             term: [
                 {"choice": i, "product": c.name, "size": c.size, "price": (c.price_cents or 0) / 100,
                  "bio": c.bio, "promo": c.promo, "product_id": c.product_id}
-                for i, c in enumerate(plan.choices[term][:8], 1)
+                for i, c in enumerate(plan.choices[term], 1)
             ]
             for term in plan.pending
         },
@@ -627,7 +653,8 @@ def render_markdown(plan: Plan, checkout: dict | None) -> str:
                 out.append(f"  {i}. {describe(cand, plan.currency)}")
             out.append("")
         picks = " ".join(f"--pick {shlex.quote(t + '=1')}" for t in plan.pending)
-        out.append(f"Re-run with {picks} (or --auto to take the top match).\n")
+        out.append(f"Re-run with {picks} (or --auto to take the top match). Use TERM=text to let Pepesto "
+                   "find the item itself at checkout, TERM=skip to drop it; --json lists every candidate.\n")
 
     if plan.lines or plan.unresolved:
         out.append(f"## Cart: {plan.store}\n")
@@ -760,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     shop.add_argument("items", nargs="*", help="grocery items (commas or separate args)")
     shop.add_argument("-f", "--file", help="read the list from a file ('-' for stdin)")
     shop.add_argument("-s", "--store", default=os.environ.get("PEPESTO_STORE", "migros"), help="migros or coop")
-    shop.add_argument("--pick", action="append", metavar="TERM=N", help="choose candidate N for TERM (or TERM=skip)")
+    shop.add_argument("--pick", action="append", metavar="TERM=N", help="candidate N for TERM; TERM=text lets Pepesto find it at checkout; TERM=skip drops it")
     shop.add_argument("--auto", action="store_true", help="take the top match for items without a choice")
     shop.add_argument("--remember-auto", action="store_true", help="also remember --auto choices")
     shop.add_argument("--no-prompt", action="store_true", help="never prompt; list choices and exit 2 instead")

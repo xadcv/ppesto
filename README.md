@@ -28,6 +28,8 @@ Looked up in this order, and never written anywhere by the tool:
 ./pepesto_cart.py shop -s coop -f list.txt --no-prompt     # prints numbered choices, exits 2
 ./pepesto_cart.py shop -s coop -f list.txt --pick eggs=3 --pick milk=1 --pick butter=skip
 #   the second run reuses the cached search (6 h), so you only pay once for it
+#   TERM=text sends the item as free text so Pepesto finds it at checkout across the whole store,
+#   e.g. --pick 'half hercules bread=text' when the quick search has nothing close
 
 # Take Pepesto's top match for anything not remembered or picked
 ./pepesto_cart.py shop -s migros "eggs, butter, rice" --auto

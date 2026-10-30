@@ -61,6 +61,15 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(pc.barcode_for({"product_id": "https://www.migros.ch/de/product/mo/10441769"}), "10441769")
         self.assertEqual(pc.barcode_for({"product_id": "https://www.coop.ch/de/x/eier/p/3080191"}), "3080191")
 
+    def test_items_reordered_by_pepesto_are_mapped_by_meaning(self):
+        names = ["Yogurt", "Tomatoes", "Bread", "Eggs", "Parmesan cheese"]
+        items = [{"item_name": n, "products": [{"product": {"category": n}}]} for n in names]
+        terms = ["half hercules bread", "bio eggs", "parmesan cheese", "large greek yoghurt", "bio tomatoes"]
+        mapping = pc.map_items_to_terms(terms, items)
+        self.assertEqual({t: mapping[t]["item_name"] for t in terms}, {
+            "half hercules bread": "Bread", "bio eggs": "Eggs", "parmesan cheese": "Parmesan cheese",
+            "large greek yoghurt": "Yogurt", "bio tomatoes": "Tomatoes"})
+
     def test_items_mapped_back_to_user_terms_when_counts_differ(self):
         items = [{"item_name": "Cow's milk", "products": []}, {"item_name": "Eggs", "products": []}]
         mapping = pc.map_items_to_terms(["eggs", "milk", "saffron"], items)
@@ -122,6 +131,12 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(second.searches, [])
         self.assertEqual([(l.source, l.units) for l in plan2.lines], [("memory", 3), ("memory", 1)])
 
+    def test_pepesto_quantity_only_used_when_list_states_an_amount(self):
+        response = {"currency": "CHF", "items": [
+            {"item_name": "Tomatoes", "products": [product("Bio Cherry Tomatoes 300 g", "m/tom", 595, units=2)]}]}
+        self.assertEqual(self.plan("bio tomatoes", FakeClient(response), auto=True).lines[0].units, 1)
+        self.assertEqual(self.plan("600 g bio tomatoes", FakeClient(response), auto=True).lines[0].units, 2)
+
     def test_auto_not_remembered_unless_asked(self):
         plan = self.plan("eggs", FakeClient(), auto=True)
         self.assertEqual(plan.lines[0].source, "auto")
@@ -140,6 +155,15 @@ class PlanTests(unittest.TestCase):
         plan = self.plan("eggs, milk, saffron threads", client, picks={"eggs": "skip"}, auto=True)
         self.assertEqual([l.term for l in plan.lines], ["milk"])
         self.assertEqual(plan.unresolved, ["saffron threads"])
+
+    def test_text_pick_sends_item_to_checkout_as_free_text_and_is_not_remembered(self):
+        plan = self.plan("half Hercules bread, eggs", FakeClient({"currency": "CHF", "items": [
+            {"item_name": "Bread", "products": [product("Ticino bread", "m/bread", 200)]},
+            PRODUCTS_RESPONSE["items"][0]]}), picks={"half hercules bread": "text", "eggs": "1"})
+        self.assertEqual(plan.unresolved, ["half Hercules bread"])
+        self.assertEqual([l.term for l in plan.lines], ["eggs"])
+        self.assertEqual(pc.remember_choices(plan, self.memory, remember_auto=False), 1)
+        self.assertIsNone(self.memory.get("half hercules bread", "migros.ch"))
 
     def test_interactive_prompt(self):
         answers = iter(["9", "2", ""])
